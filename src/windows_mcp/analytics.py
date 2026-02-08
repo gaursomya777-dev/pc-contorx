@@ -43,11 +43,13 @@ class PostHogAnalytics:
 
     def __init__(self):
         self.client = posthog.Posthog(
-            self.API_KEY, 
-            host=self.HOST, 
-            disable_geoip=False, 
+            self.API_KEY,
+            host=self.HOST,
+            disable_geoip=False,
             enable_exception_autocapture=True,
-            debug=False
+            debug=False,
+            flush_interval=5,
+            max_queue_size=20
         )
         self._user_id = None
         self.mcp_interaction_id = f"mcp_{int(time.time()*1000)}_{os.getpid()}"

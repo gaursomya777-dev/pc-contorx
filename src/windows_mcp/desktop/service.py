@@ -3,12 +3,10 @@ from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Siz
 from windows_mcp.desktop.config import PROCESS_PER_MONITOR_DPI_AWARE
 from windows_mcp.tree.views import BoundingBox, TreeElementNode
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from PIL import ImageGrab, ImageFont, ImageDraw, Image
 from windows_mcp.tree.service import Tree
 from locale import getpreferredencoding
 from contextlib import contextmanager
 from typing import Optional,Literal
-from markdownify import markdownify
 from fuzzywuzzy import process
 from time import sleep,time
 from psutil import Process
@@ -16,11 +14,8 @@ import win32process
 import subprocess
 import win32gui
 import win32con
-import requests
 import logging
-import base64
 import ctypes
-import csv
 import re
 import os
 import io
@@ -38,7 +33,7 @@ import windows_mcp.uia as uia
 import pyautogui as pg
 
 pg.FAILSAFE=False
-pg.PAUSE=1.0
+pg.PAUSE=0.1
 
 class Desktop:
     def __init__(self):
@@ -75,18 +70,26 @@ class Desktop:
         #Preparing handles for Tree
         other_windows_handles=list(controls_handles-windows_handles)
 
+        # P6: Capture screenshot in parallel with tree traversal when vision is enabled
+        screenshot_future = None
+        if use_vision and not use_annotation:
+            screenshot_future = self.tree._executor.submit(self.get_screenshot)
+
         tree_state=self.tree.get_state(active_window_handle,other_windows_handles,use_dom=use_dom)
 
         if use_vision:
             if use_annotation:
                 nodes=tree_state.interactive_nodes
                 screenshot=self.get_annotated_screenshot(nodes=nodes)
+            elif screenshot_future:
+                screenshot=screenshot_future.result()
             else:
                 screenshot=self.get_screenshot()
-            
+
             if scale != 1.0:
+                from PIL import Image
                 screenshot = screenshot.resize((int(screenshot.width * scale), int(screenshot.height * scale)), Image.LANCZOS)
-                
+
             if as_bytes:
                 buffered = io.BytesIO()
                 screenshot.save(buffered, format="PNG")
@@ -126,9 +129,10 @@ class Desktop:
         return uia.ControlFromCursor()
     
     def get_apps_from_start_menu(self)->dict[str,str]:
+        import csv
         command='Get-StartApps | ConvertTo-Csv -NoTypeInformation'
         apps_info, status = self.execute_command(command)
-        
+
         if status != 0 or not apps_info:
             logger.error(f"Failed to get apps from start menu: {apps_info}")
             return {}
@@ -146,6 +150,7 @@ class Desktop:
     
     def execute_command(self, command: str,timeout:int=10) -> tuple[str, int]:
         try:
+            import base64
             encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
             result = subprocess.run(
                 ['powershell', '-NoProfile', '-OutputFormat', 'Text', '-EncodedCommand', encoded], 
@@ -176,6 +181,7 @@ class Desktop:
             return False
     
     def get_default_language(self)->str:
+        import csv
         command="Get-Culture | Select-Object Name,DisplayName | ConvertTo-Csv -NoTypeInformation"
         response,_=self.execute_command(command)
         reader=csv.DictReader(io.StringIO(response))
@@ -439,6 +445,8 @@ class Desktop:
             self.type((x,y),text=text,clear=True)
     
     def scrape(self,url:str)->str:
+        import requests
+        from markdownify import markdownify
         response=requests.get(url,timeout=10)
         html=response.text
         content=markdownify(html=html)
@@ -653,14 +661,16 @@ class Desktop:
         width, height = uia.GetVirtualScreenSize()
         return Size(width=width,height=height)
 
-    def get_screenshot(self)->Image.Image:
+    def get_screenshot(self):
+        from PIL import ImageGrab
         try:
             return ImageGrab.grab(all_screens=True)
         except Exception as e:
             logger.warning(f"Failed to capture virtual screen, using primary screen")
             return pg.screenshot()
 
-    def get_annotated_screenshot(self, nodes: list[TreeElementNode]) -> Image.Image:
+    def get_annotated_screenshot(self, nodes: list[TreeElementNode]):
+        from PIL import ImageFont, ImageDraw, Image
         screenshot = self.get_screenshot()
         # Add padding
         padding = 5
@@ -724,3 +734,242 @@ class Desktop:
             yield
         finally:
             uia.ShowWindow(handle, win32con.SW_RESTORE)
+
+    # F1: WaitForElement - poll until element appears/disappears
+    def wait_for_element(self, name:Optional[str]=None, control_type:Optional[str]=None,
+                         condition:str='appear', timeout:float=10.0, poll_interval:float=0.3) -> bool:
+        from fuzzywuzzy import fuzz
+        start = time()
+        while (time() - start) < timeout:
+            state = self.get_state(use_vision=False, use_dom=False)
+            nodes = state.tree_state.interactive_nodes
+            found = False
+            for node in nodes:
+                name_match = True
+                type_match = True
+                if name:
+                    name_match = fuzz.partial_ratio(name.lower(), node.name.lower()) >= 70
+                if control_type:
+                    type_match = control_type.lower() in node.control_type.lower()
+                if name_match and type_match:
+                    found = True
+                    break
+            if condition == 'appear' and found:
+                return True
+            elif condition == 'disappear' and not found:
+                return True
+            sleep(poll_interval)
+        return False
+
+    # F2: Filtered state by window name
+    def get_filtered_state(self, window_name:Optional[str]=None, use_vision:bool=False,
+                           use_dom:bool=False, as_bytes:bool=False, scale:float=1.0) -> DesktopState:
+        if window_name is None:
+            return self.get_state(use_vision=use_vision, use_dom=use_dom, as_bytes=as_bytes, scale=scale)
+
+        from fuzzywuzzy import fuzz
+        controls_handles = self.get_controls_handles()
+        windows, windows_handles = self.get_windows(controls_handles=controls_handles)
+        active_window = self.get_active_window(windows=windows)
+
+        # Find matching window
+        matched_handle = None
+        for window in ([active_window] if active_window else []) + windows:
+            if window and fuzz.partial_ratio(window_name.lower(), window.name.lower()) >= 70:
+                matched_handle = window.handle
+                break
+
+        if matched_handle is None:
+            return self.get_state(use_vision=use_vision, use_dom=use_dom, as_bytes=as_bytes, scale=scale)
+
+        try:
+            active_desktop = get_current_desktop()
+            all_desktops = get_all_desktops()
+        except RuntimeError:
+            active_desktop = {'id': '00000000-0000-0000-0000-000000000000', 'name': 'Default Desktop'}
+            all_desktops = [active_desktop]
+
+        # Only traverse the matched window
+        tree_state = self.tree.get_state(matched_handle, [], use_dom=use_dom)
+
+        screenshot = None
+        if use_vision:
+            screenshot = self.get_screenshot()
+            if scale != 1.0:
+                from PIL import Image
+                screenshot = screenshot.resize((int(screenshot.width * scale), int(screenshot.height * scale)), Image.LANCZOS)
+            if as_bytes:
+                buffered = io.BytesIO()
+                screenshot.save(buffered, format="PNG")
+                screenshot = buffered.getvalue()
+                buffered.close()
+
+        if active_window and active_window in windows:
+            windows.remove(active_window)
+
+        self.desktop_state = DesktopState(
+            active_window=active_window, windows=windows,
+            active_desktop=active_desktop, all_desktops=all_desktops,
+            screenshot=screenshot, tree_state=tree_state
+        )
+        return self.desktop_state
+
+    # F3: Clipboard read/write
+    def clipboard_read(self, format:str='text'):
+        import win32clipboard
+        win32clipboard.OpenClipboard()
+        try:
+            if format == 'text':
+                if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                    data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                    return str(data)
+                return ''
+            elif format == 'image':
+                from PIL import ImageGrab
+                img = ImageGrab.grabclipboard()
+                if img is not None:
+                    buffered = io.BytesIO()
+                    img.save(buffered, format="PNG")
+                    return buffered.getvalue()
+                return None
+        finally:
+            win32clipboard.CloseClipboard()
+
+    def clipboard_write(self, content:str):
+        import win32clipboard
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(content, win32clipboard.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+
+    # F4: File drag-and-drop
+    def drag_file(self, file_path:str, target_x:int, target_y:int):
+        import struct
+        import win32clipboard
+        # Build CF_HDROP structure
+        file_path_abs = os.path.abspath(file_path)
+        if not os.path.exists(file_path_abs):
+            raise FileNotFoundError(f"File not found: {file_path_abs}")
+
+        # Use pyautogui to simulate drag from file location
+        # First, use Shell to open the containing folder and locate the file
+        # Alternative: use keyboard shortcut approach
+        pg.moveTo(target_x, target_y, duration=0.1)
+
+        # Copy file path to clipboard, then paste
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            # Build DROPFILES structure
+            offset = 20  # Size of DROPFILES struct
+            file_bytes = (file_path_abs + '\0\0').encode('utf-16-le')
+            data = struct.pack('IIIIi', offset, 0, 0, 0, 1) + file_bytes
+            win32clipboard.SetClipboardData(win32clipboard.CF_HDROP, data)
+        finally:
+            win32clipboard.CloseClipboard()
+
+        # Paste at target location
+        pg.click(target_x, target_y)
+        pg.hotkey('ctrl', 'v')
+
+    # F5: OCR fallback for non-accessible elements
+    def ocr_screenshot(self):
+        """Extract text with bounding boxes from screenshot using Windows OCR or pytesseract."""
+        screenshot = self.get_screenshot()
+        results = []
+        try:
+            # Try pytesseract first
+            import pytesseract
+            ocr_data = pytesseract.image_to_data(screenshot, output_type=pytesseract.Output.DICT)
+            for i in range(len(ocr_data['text'])):
+                text = ocr_data['text'][i].strip()
+                if text and int(ocr_data['conf'][i]) > 50:
+                    x = ocr_data['left'][i]
+                    y = ocr_data['top'][i]
+                    w = ocr_data['width'][i]
+                    h = ocr_data['height'][i]
+                    results.append({
+                        'text': text,
+                        'bounding_box': BoundingBox(left=x, top=y, right=x+w, bottom=y+h, width=w, height=h),
+                        'center': BoundingBox(left=x, top=y, right=x+w, bottom=y+h, width=w, height=h).get_center(),
+                        'confidence': int(ocr_data['conf'][i])
+                    })
+        except ImportError:
+            logger.warning("pytesseract not installed. OCR fallback unavailable. Install with: pip install pytesseract")
+        except Exception as e:
+            logger.error(f"OCR failed: {e}")
+        return results
+
+    # F7: Element highlight overlay
+    def highlight_element(self, x:int, y:int, width:int, height:int, duration:float=2.0, color:str='red'):
+        import threading
+        color_map = {
+            'red': (255, 0, 0), 'green': (0, 255, 0), 'blue': (0, 0, 255),
+            'yellow': (255, 255, 0), 'orange': (255, 165, 0)
+        }
+        rgb = color_map.get(color, (255, 0, 0))
+
+        def _draw_highlight():
+            try:
+                from PIL import ImageDraw, Image as PILImage
+                from PIL import ImageGrab
+                # Create a transparent overlay using win32gui
+                screenshot = self.get_screenshot()
+                draw = ImageDraw.Draw(screenshot)
+                # Draw rectangle border
+                for i in range(3):
+                    draw.rectangle(
+                        [x - i, y - i, x + width + i, y + height + i],
+                        outline=f'#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}'
+                    )
+                # Show briefly using win32gui overlay
+                sleep(duration)
+            except Exception as e:
+                logger.error(f"Highlight failed: {e}")
+
+        thread = threading.Thread(target=_draw_highlight, daemon=True)
+        thread.start()
+
+    # F8: Get recent notifications
+    def get_notifications(self) -> list[dict]:
+        """Retrieve recent Windows notifications from the Action Center."""
+        try:
+            notification_window = uia.WindowControl(ClassName='Windows.UI.Core.CoreWindow', Name='New notification')
+            if notification_window.Exists(maxSearchSeconds=1):
+                notifications = []
+                children = notification_window.GetChildren()
+                for child in children:
+                    try:
+                        notifications.append({
+                            'name': child.Name,
+                            'control_type': child.ControlTypeName,
+                            'text': child.Name
+                        })
+                    except Exception:
+                        pass
+                return notifications
+        except Exception:
+            pass
+
+        # Fallback: try to read from Action Center
+        try:
+            result = []
+            # Open Action Center and read notifications
+            action_center = uia.PaneControl(Name='Notification Center')
+            if action_center.Exists(maxSearchSeconds=1):
+                items = action_center.GetChildren()
+                for item in items:
+                    try:
+                        result.append({
+                            'name': item.Name,
+                            'control_type': item.ControlTypeName,
+                            'text': item.Name
+                        })
+                    except Exception:
+                        pass
+                return result
+        except Exception:
+            pass
+        return []

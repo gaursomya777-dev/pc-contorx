@@ -17,7 +17,7 @@ load_dotenv()
 
 MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT = 1920, 1080
 pg.FAILSAFE=False
-pg.PAUSE=1.0
+pg.PAUSE=0.1
 
 desktop: Optional[Desktop] = None
 watchdog: Optional[WatchDog] = None
@@ -44,7 +44,7 @@ async def lifespan(app: FastMCP):
     
     try:
         watchdog.start()
-        await asyncio.sleep(1) # Simulate startup latency
+        await asyncio.sleep(0.1) # Brief pause for watchdog initialization
         yield
     finally:
         if watchdog:
@@ -311,6 +311,218 @@ def multi_edit_tool(locs:list[list], ctx: Context = None)->str:
     desktop.multi_edit(locs)
     elements_str = ', '.join([f"({e[0]},{e[1]}) with text '{e[2]}'" for e in locs])
     return f"Multi-edited elements at: {elements_str}"
+
+
+# F1: WaitForElement tool
+@mcp.tool(
+    name='WaitForElement',
+    description='Waits for a UI element to appear or disappear from the desktop. Useful for waiting for dialogs, page loads, or spinners. Polls the accessibility tree at a configurable interval until the element is found (or gone) or timeout is reached.',
+    annotations=ToolAnnotations(
+        title="WaitForElement",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
+)
+@with_analytics(analytics, "WaitForElement-Tool")
+def wait_for_element_tool(name:str|None=None, control_type:str|None=None,
+                          condition:Literal['appear','disappear']='appear',
+                          timeout:float=10.0, poll_interval:float=0.3, ctx: Context = None) -> str:
+    result = desktop.wait_for_element(name=name, control_type=control_type,
+                                       condition=condition, timeout=timeout, poll_interval=poll_interval)
+    target = name or control_type or 'element'
+    if result:
+        return f"Element '{target}' did {condition} within {timeout}s."
+    return f"Timeout: Element '{target}' did not {condition} within {timeout}s."
+
+# F2: Filtered Snapshot tool
+@mcp.tool(
+    name='FilteredSnapshot',
+    description='Captures desktop state filtered to a specific window by name. Much faster than full Snapshot when you only need to inspect one window. Falls back to full snapshot if window not found.',
+    annotations=ToolAnnotations(
+        title="FilteredSnapshot",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
+)
+@with_analytics(analytics, "FilteredSnapshot-Tool")
+def filtered_snapshot_tool(window_name:str, use_vision:bool|str=False, use_dom:bool|str=False, ctx: Context = None):
+    use_vision = use_vision is True or (isinstance(use_vision, str) and use_vision.lower() == 'true')
+    use_dom = use_dom is True or (isinstance(use_dom, str) and use_dom.lower() == 'true')
+
+    scale_width = MAX_IMAGE_WIDTH / screen_size.width if screen_size.width > MAX_IMAGE_WIDTH else 1.0
+    scale_height = MAX_IMAGE_HEIGHT / screen_size.height if screen_size.height > MAX_IMAGE_HEIGHT else 1.0
+    scale = min(scale_width, scale_height)
+
+    desktop_state = desktop.get_filtered_state(window_name=window_name, use_vision=use_vision, use_dom=use_dom, as_bytes=True, scale=scale)
+    interactive_elements = desktop_state.tree_state.interactive_elements_to_string()
+    scrollable_elements = desktop_state.tree_state.scrollable_elements_to_string()
+    windows = desktop_state.windows_to_string()
+    active_window = desktop_state.active_window_to_string()
+
+    return [dedent(f'''
+    Filtered by window: {window_name}
+
+    Focused Window:
+    {active_window}
+
+    Opened Windows:
+    {windows}
+
+    List of Interactive Elements:
+    {interactive_elements or 'No interactive elements found.'}
+
+    List of Scrollable Elements:
+    {scrollable_elements or 'No scrollable elements found.'}
+    ''')] + ([Image(data=desktop_state.screenshot, format='png')] if use_vision else [])
+
+# F3: Clipboard tool
+@mcp.tool(
+    name='Clipboard',
+    description="Reads or writes the system clipboard. Mode 'read' returns current clipboard content (text or image). Mode 'write' sets clipboard text content.",
+    annotations=ToolAnnotations(
+        title="Clipboard",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False
+    )
+)
+@with_analytics(analytics, "Clipboard-Tool")
+def clipboard_tool(mode:Literal['read','write'], content:str|None=None,
+                   format:Literal['text','image']='text', ctx: Context = None):
+    if mode == 'read':
+        result = desktop.clipboard_read(format=format)
+        if format == 'image' and result:
+            return [Image(data=result, format='png')]
+        return f"Clipboard content: {result}" if result else "Clipboard is empty."
+    elif mode == 'write':
+        if content is None:
+            return "Error: content is required for write mode."
+        desktop.clipboard_write(content)
+        return f"Clipboard set to: {content[:100]}{'...' if len(content) > 100 else ''}"
+
+# F4: DragFile tool
+@mcp.tool(
+    name='DragFile',
+    description='Drags a file from the file system to a target location on screen. Copies the file path to clipboard as CF_HDROP and pastes at the target coordinates.',
+    annotations=ToolAnnotations(
+        title="DragFile",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False
+    )
+)
+@with_analytics(analytics, "DragFile-Tool")
+def drag_file_tool(file_path:str, target_x:int, target_y:int, ctx: Context = None) -> str:
+    try:
+        desktop.drag_file(file_path, target_x, target_y)
+        return f"File '{file_path}' dropped at ({target_x},{target_y})."
+    except FileNotFoundError as e:
+        return str(e)
+
+# F5: OCR tool
+@mcp.tool(
+    name='OCR',
+    description='Extracts text from the current screen using OCR (Optical Character Recognition). Useful when accessibility tree returns no elements (custom UIs, games, PDF viewers). Returns text with bounding box coordinates. Requires pytesseract to be installed.',
+    annotations=ToolAnnotations(
+        title="OCR",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
+)
+@with_analytics(analytics, "OCR-Tool")
+def ocr_tool(ctx: Context = None) -> str:
+    results = desktop.ocr_screenshot()
+    if not results:
+        return "No text detected via OCR. Ensure pytesseract is installed."
+    lines = ["# OCR Results", "# text|coords|confidence"]
+    for r in results:
+        lines.append(f"{r['text']}|({r['center'].x},{r['center'].y})|{r['confidence']}%")
+    return "\n".join(lines)
+
+# F6: Batch execution tool
+@mcp.tool(
+    name='Batch',
+    description='Executes multiple actions in a single call to reduce round-trips. Accepts a list of actions, each with a tool name and parameters. Actions are executed sequentially. Supported tools: Click, Type, Scroll, Move, Shortcut, Wait.',
+    annotations=ToolAnnotations(
+        title="Batch",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False
+    )
+)
+@with_analytics(analytics, "Batch-Tool")
+def batch_tool(actions:list[dict], ctx: Context = None) -> str:
+    results = []
+    tool_map = {
+        'click': lambda p: (desktop.click(loc=p['loc'], button=p.get('button', 'left'), clicks=p.get('clicks', 1)), f"Clicked at {p['loc']}"),
+        'type': lambda p: (desktop.type(loc=p['loc'], text=p['text'], caret_position=p.get('caret_position', 'idle'), clear=p.get('clear', False), press_enter=p.get('press_enter', False)), f"Typed '{p['text']}' at {p['loc']}"),
+        'scroll': lambda p: (desktop.scroll(loc=p.get('loc'), type=p.get('type', 'vertical'), direction=p.get('direction', 'down'), wheel_times=p.get('wheel_times', 1)), f"Scrolled {p.get('direction', 'down')}"),
+        'move': lambda p: (desktop.move(loc=p['loc']), f"Moved to {p['loc']}"),
+        'shortcut': lambda p: (desktop.shortcut(p['shortcut']), f"Pressed {p['shortcut']}"),
+        'wait': lambda p: (pg.sleep(p.get('duration', 1)), f"Waited {p.get('duration', 1)}s"),
+    }
+
+    for i, action in enumerate(actions):
+        tool_name = action.get('tool', '').lower()
+        params = action.get('params', {})
+        try:
+            if tool_name in tool_map:
+                _, msg = tool_map[tool_name](params)
+                results.append(f"[{i}] OK: {msg}")
+            else:
+                results.append(f"[{i}] ERROR: Unknown tool '{tool_name}'")
+        except Exception as e:
+            results.append(f"[{i}] ERROR: {e}")
+    return "\n".join(results)
+
+# F7: Highlight tool
+@mcp.tool(
+    name='Highlight',
+    description='Draws a temporary colored rectangle overlay on a target area for visual debugging. Useful for confirming which element the agent is targeting before clicking.',
+    annotations=ToolAnnotations(
+        title="Highlight",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
+)
+@with_analytics(analytics, "Highlight-Tool")
+def highlight_tool(x:int, y:int, width:int, height:int,
+                   duration:float=2.0, color:str='red', ctx: Context = None) -> str:
+    desktop.highlight_element(x, y, width, height, duration, color)
+    return f"Highlighting ({x},{y}) {width}x{height} in {color} for {duration}s."
+
+# F8: GetNotifications tool
+@mcp.tool(
+    name='GetNotifications',
+    description='Retrieves recent Windows notifications/toasts from the system. Checks the notification area and Action Center for visible notifications.',
+    annotations=ToolAnnotations(
+        title="GetNotifications",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
+)
+@with_analytics(analytics, "GetNotifications-Tool")
+def get_notifications_tool(ctx: Context = None) -> str:
+    notifications = desktop.get_notifications()
+    if not notifications:
+        return "No notifications found."
+    lines = ["# Recent Notifications"]
+    for i, n in enumerate(notifications):
+        lines.append(f"{i}. [{n.get('control_type', 'Unknown')}] {n.get('text', '')}")
+    return "\n".join(lines)
 
 
 @click.command()
